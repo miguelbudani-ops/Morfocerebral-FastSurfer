@@ -1,0 +1,179 @@
+###########################################################
+# Fast/Free/FSL pipeline base - Ubuntu 22.04
+#   * Replica FreeSurfer + FastSurfer del host
+#   * Instala FSL completo, dcm2niix, Xvfb/Qt, Chrome/Chromedriver
+#   * Provisiona 2 entornos Conda (fastsurfer y morfometría)
+#   * Incluye soporte headless para Freeview y Selenium
+###########################################################
+
+FROM ubuntu:22.04
+
+LABEL maintainer="Tu Nombre / Institución" \
+      org.opencontainers.image.title="FastSurfer + FreeSurfer + FSL pipeline" \
+      org.opencontainers.image.description="Imagen reproducible para pipeline de morfometría (FastSurfer/FreeSurfer/FSL) con dos entornos conda, Freeview headless y Selenium headless" \
+      org.opencontainers.image.source="local"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+###########################################################
+# Paquetes de sistema (build, Xvfb, Qt runtime, dcm2niix, etc.)
+# + extras gráficos (xpra, xdotool, wmctrl, openbox, gtk/dbus-x11)
+# + dependencias comunes para Chrome headless
+###########################################################
+RUN set -euxo pipefail && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget unzip git gnupg \
+        build-essential cmake \
+        python3 python3-pip python3-dev \
+        tcsh lsb-release sudo \
+        xorg xvfb xauth x11-apps \
+        libgl1 libglu1-mesa mesa-utils \
+        libxrender1 libxtst6 libxcomposite1 libxss1 libxi6 libxrandr2 libxfixes3 libxdamage1 libxft2 \
+        libsm6 libice6 libxcb1 libxkbcommon-x11-0 \
+        fontconfig imagemagick \
+        dcm2niix \
+        xpra xdotool wmctrl openbox \
+        dbus-x11 libgtk-3-0 libasound2 libnspr4 libnss3 libgbm1 xdg-utils fonts-liberation libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+###########################################################
+# FreeSurfer: copia exacta del host
+#   - Espera estructura local: ./freesurfer/…
+#   - Opcional: incluir licencia con `COPY license.txt`
+###########################################################
+ENV FREESURFER_HOME=/usr/local/freesurfer
+COPY freesurfer ${FREESURFER_HOME}
+# COPY license.txt ${FREESURFER_HOME}/.license
+
+RUN echo "source ${FREESURFER_HOME}/SetUpFreeSurfer.sh" > /etc/profile.d/freesurfer.sh && \
+    chmod +x /etc/profile.d/freesurfer.sh
+
+###########################################################
+# FSL (instalador oficial)
+###########################################################
+RUN set -euxo pipefail && \
+    wget -O- https://fsl.fmrib.ox.ac.uk/fsldownloads/fslinstaller.py | \
+        python3 - --dest=/usr/local/fsl --quiet
+
+ENV FSLDIR=/usr/local/fsl \
+    FSLOUTPUTTYPE=NIFTI_GZ
+
+RUN bash -lc 'set -euxo pipefail && \
+    echo "FSLDIR=/usr/local/fsl" > /etc/profile.d/fsl.sh && \
+    echo ". \${FSLDIR}/etc/fslconf/fsl.sh" >> /etc/profile.d/fsl.sh && \
+    echo "export FSLDIR FSLOUTPUTTYPE PATH" >> /etc/profile.d/fsl.sh && \
+    chmod +x /etc/profile.d/fsl.sh'
+
+###########################################################
+# FastSurfer: copia del repo local (incluye checkpoints)
+#   - Ajusta la ruta si tu carpeta se llama distinto
+###########################################################
+ARG FASTSURFER_SRC=FastSurfer
+ENV FASTSURFER_HOME=/opt/FastSurfer
+COPY ${FASTSURFER_SRC} ${FASTSURFER_HOME}
+
+###########################################################
+# Miniconda + mamba + entornos
+#   - fastsurfer (3.9) con requirements.txt si existe
+#   - morfometría (desde morfometria_env.yml si existe)
+###########################################################
+RUN set -euxo pipefail && \
+    wget -O /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm -f /tmp/miniconda.sh
+
+RUN set -euxo pipefail && \
+    /opt/conda/bin/conda install -y -n base -c conda-forge mamba && \
+    /opt/conda/bin/conda clean -afy
+
+RUN set -euxo pipefail && \
+    /opt/conda/bin/mamba create -y -n fastsurfer python=3.9 && \
+    /opt/conda/bin/conda clean -afy
+
+RUN set -euxo pipefail && \
+    if [ -f "${FASTSURFER_HOME}/requirements.txt" ]; then \
+        /opt/conda/bin/conda run -n fastsurfer python -m pip install --upgrade pip && \
+        /opt/conda/bin/conda run -n fastsurfer python -m pip install --no-cache-dir -r "${FASTSURFER_HOME}/requirements.txt"; \
+    else \
+        echo "Aviso: ${FASTSURFER_HOME}/requirements.txt no encontrado; instala dependencias manualmente." >&2; \
+    fi
+
+###########################################################
+# App (scripts locales)
+#   - Ajusta APP_SRC si tu carpeta tiene otro nombre
+###########################################################
+ARG APP_SRC=Fastsurfer_local
+COPY ${APP_SRC} /app
+WORKDIR /app
+
+ARG MORFOMETRIA_ENV=./morfometria_env.yml
+RUN set -euxo pipefail && \
+    if [ -f "${MORFOMETRIA_ENV}" ]; then \
+        cp "${MORFOMETRIA_ENV}" /tmp/morfometria_env.yml && \
+        (/opt/conda/bin/mamba env create -f /tmp/morfometria_env.yml || /opt/conda/bin/conda env create -f /tmp/morfometria_env.yml) && \
+        rm -f /tmp/morfometria_env.yml && \
+        /opt/conda/bin/conda clean -afy; \
+    else \
+        echo "Aviso: ${MORFOMETRIA_ENV} no encontrado; omitiendo entorno morfometría." >&2; \
+    fi
+
+###########################################################
+# Chrome + Chromedriver (Selenium headless)
+###########################################################
+RUN set -euxo pipefail && \
+    mkdir -p /usr/share/keyrings && \
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | \
+        gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends google-chrome-stable && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -euxo pipefail && \
+    CHROME_MAJOR="$(google-chrome --version | sed -E 's/.* ([0-9]+)\..*/\1/')" && \
+    DRIVER_VER="$(wget -qO- "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}")" && \
+    wget -q -O /tmp/chromedriver.zip "https://chromedriver.storage.googleapis.com/${DRIVER_VER}/chromedriver_linux64.zip" && \
+    unzip -q /tmp/chromedriver.zip -d /usr/local/bin/ && \
+    chmod +x /usr/local/bin/chromedriver && \
+    rm -f /tmp/chromedriver.zip
+
+###########################################################
+# Headless Freeview (Xvfb) y variables X/Qt/GTK
+###########################################################
+ENV DISPLAY=:99 \
+    QT_QPA_PLATFORM=xcb \
+    XDG_RUNTIME_DIR=/tmp/runtime-root \
+    QT_X11_NO_MITSHM=1 \
+    GTK_IM_MODULE=none \
+    XCOMPOSEFILE=/usr/share/X11/locale/en_US.UTF-8/Compose \
+    PATH=/opt/conda/bin:/usr/local/fsl/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN set -euxo pipefail && \
+    mkdir -p /tmp/runtime-root && \
+    cat <<'EOF' >/usr/local/bin/start_xvfb.sh
+#!/usr/bin/env bash
+set -euo pipefail
+if pgrep -x Xvfb >/dev/null; then
+  exit 0
+fi
+Xvfb :99 -screen 0 1280x1024x24 &
+disown
+sleep 1
+EOF
+
+RUN set -euxo pipefail && chmod +x /usr/local/bin/start_xvfb.sh
+
+###########################################################
+# Directorios de trabajo estándar (montar con -v en runtime)
+###########################################################
+ENV SUBJECTS_DIR=/data/subjects
+
+###########################################################
+# Entrypoint/Comando por defecto
+###########################################################
+CMD ["bash"]
