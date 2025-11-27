@@ -74,7 +74,8 @@ Morfocerebral-FastSurfer/
 │   ├── grafico_de_barras.py
 │   └── grafico_de_cajas.py
 ├── Dockerfile
-├── morfo_email.sh 
+├── morfofast_email.sh
+├── reporte_email.sh 
 ├── extract_patient_name.py
 ├── main_local.py
 ├── morfometria_env.yml
